@@ -142,7 +142,7 @@ describe("anchor_escrow_q4_25", () => {
 
     // Take
     await program.methods
-      .take()
+      .take(new anchor.BN(receiveAmount))
       .accountsStrict({
         taker: taker.publicKey,
         maker: maker,
@@ -173,5 +173,109 @@ describe("anchor_escrow_q4_25", () => {
 
     const makerBalanceB = (await provider.connection.getTokenAccountBalance(makerAtaB)).value.uiAmount;
     expect(makerBalanceB).to.equal(receiveAmount);
+  });
+
+  it("Updates the escrow price, guards take against stale prices, then takes", async () => {
+    const seed3 = new anchor.BN(3333);
+    [escrowPda, escrowBump] = anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), maker.toBuffer(), seed3.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+    vault = getAssociatedTokenAddressSync(mintA, escrowPda, true);
+    const newReceiveAmount = 150;
+
+    // Balances before (takerAtaA / makerAtaB already exist from the previous test)
+    const takerABefore = (await provider.connection.getTokenAccountBalance(takerAtaA)).value.uiAmount;
+    const makerBBefore = (await provider.connection.getTokenAccountBalance(makerAtaB)).value.uiAmount;
+
+    // Make
+    await program.methods
+      .make(seed3, new anchor.BN(depositAmount), new anchor.BN(receiveAmount))
+      .accountsStrict({
+        maker: maker,
+        mintA: mintA,
+        mintB: mintB,
+        makerAtaA: makerAtaA,
+        escrow: escrowPda,
+        vault: vault,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    // Someone other than the maker cannot update the price
+    try {
+      await program.methods
+        .update(new anchor.BN(1))
+        .accountsStrict({ maker: taker.publicKey, escrow: escrowPda })
+        .signers([taker])
+        .rpc();
+      expect.fail("non-maker update should have failed");
+    } catch (err) {
+      expect(err).to.be.instanceOf(anchor.AnchorError);
+    }
+
+    // A zero price is rejected
+    try {
+      await program.methods
+        .update(new anchor.BN(0))
+        .accountsStrict({ maker: maker, escrow: escrowPda })
+        .rpc();
+      expect.fail("zero price update should have failed");
+    } catch (err) {
+      expect((err as anchor.AnchorError).error.errorCode.code).to.equal("InvalidAmount");
+    }
+
+    // Maker updates the price
+    await program.methods
+      .update(new anchor.BN(newReceiveAmount))
+      .accountsStrict({ maker: maker, escrow: escrowPda })
+      .rpc();
+
+    const escrowAccount = await program.account.escrow.fetch(escrowPda);
+    expect(escrowAccount.receive.toNumber()).to.equal(newReceiveAmount);
+
+    const takeAccounts = {
+      taker: taker.publicKey,
+      maker: maker,
+      mintA: mintA,
+      mintB: mintB,
+      takerAtaA: takerAtaA,
+      takerAtaB: takerAtaB,
+      makerAtaB: makerAtaB,
+      escrow: escrowPda,
+      vault: vault,
+      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      systemProgram: anchor.web3.SystemProgram.programId,
+    };
+
+    // Taker still expects the old price -> rejected
+    try {
+      await program.methods
+        .take(new anchor.BN(receiveAmount))
+        .accountsStrict(takeAccounts)
+        .signers([taker])
+        .rpc();
+      expect.fail("take with stale price should have failed");
+    } catch (err) {
+      expect((err as anchor.AnchorError).error.errorCode.code).to.equal("PriceChanged");
+    }
+
+    // Taker takes at the new price
+    await program.methods
+      .take(new anchor.BN(newReceiveAmount))
+      .accountsStrict(takeAccounts)
+      .signers([taker])
+      .rpc();
+
+    expect(await provider.connection.getAccountInfo(escrowPda)).to.be.null;
+    expect(await provider.connection.getAccountInfo(vault)).to.be.null;
+
+    const takerAAfter = (await provider.connection.getTokenAccountBalance(takerAtaA)).value.uiAmount;
+    const makerBAfter = (await provider.connection.getTokenAccountBalance(makerAtaB)).value.uiAmount;
+    expect(takerAAfter - takerABefore).to.equal(depositAmount);
+    expect(makerBAfter - makerBBefore).to.equal(newReceiveAmount);
   });
 });
