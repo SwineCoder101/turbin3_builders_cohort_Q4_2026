@@ -21,4 +21,12 @@ impl<'info> Update<'info> {
         self.escrow.receive = new_receive;
         Ok(())
     }
+
+    /// Set a new future expiration, or `None` to make the offer never expire.
+    /// Works on an already-expired escrow, so the maker can revive it.
+    pub fn update_expiration(&mut self, new_expiration: Option<i64>) -> Result<()> {
+        Escrow::validate_expiration(new_expiration, Clock::get()?.unix_timestamp)?;
+        self.escrow.expiration = new_expiration;
+        Ok(())
+    }
 }

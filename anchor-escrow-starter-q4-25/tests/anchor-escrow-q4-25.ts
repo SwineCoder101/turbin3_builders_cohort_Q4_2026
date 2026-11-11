@@ -44,14 +44,14 @@ describe("anchor_escrow_q4_25", () => {
       createAssociatedTokenAccountInstruction(provider.wallet.publicKey, makerAtaA, maker, mintA)
     );
     await provider.sendAndConfirm(makerAtaATx);
-    await mintTo(provider.connection, provider.wallet.payer, mintA, makerAtaA, provider.wallet.payer, depositAmount * 2);
+    await mintTo(provider.connection, provider.wallet.payer, mintA, makerAtaA, provider.wallet.payer, depositAmount * 10);
 
     takerAtaB = getAssociatedTokenAddressSync(mintB, taker.publicKey);
     const takerAtaBTx = new anchor.web3.Transaction().add(
       createAssociatedTokenAccountInstruction(taker.publicKey, takerAtaB, taker.publicKey, mintB)
     );
     await provider.sendAndConfirm(takerAtaBTx, [taker]);
-    await mintTo(provider.connection, taker, mintB, takerAtaB, taker, receiveAmount * 2);
+    await mintTo(provider.connection, taker, mintB, takerAtaB, taker, receiveAmount * 10);
 
   });
 
@@ -65,7 +65,7 @@ describe("anchor_escrow_q4_25", () => {
 
     // Make
     await program.methods
-      .make(seed1, new anchor.BN(depositAmount), new anchor.BN(receiveAmount))
+      .make(seed1, new anchor.BN(depositAmount), new anchor.BN(receiveAmount), null)
       .accountsStrict({
         maker: maker,
         mintA: mintA,
@@ -122,7 +122,7 @@ describe("anchor_escrow_q4_25", () => {
 
     // Make (again for take path)
     await program.methods
-      .make(seed2, new anchor.BN(depositAmount), new anchor.BN(receiveAmount))
+      .make(seed2, new anchor.BN(depositAmount), new anchor.BN(receiveAmount), null)
       .accountsStrict({
         maker: maker,
         mintA: mintA,
@@ -190,7 +190,7 @@ describe("anchor_escrow_q4_25", () => {
 
     // Make
     await program.methods
-      .make(seed3, new anchor.BN(depositAmount), new anchor.BN(receiveAmount))
+      .make(seed3, new anchor.BN(depositAmount), new anchor.BN(receiveAmount), null)
       .accountsStrict({
         maker: maker,
         mintA: mintA,
@@ -277,5 +277,164 @@ describe("anchor_escrow_q4_25", () => {
     const makerBAfter = (await provider.connection.getTokenAccountBalance(makerAtaB)).value.uiAmount;
     expect(takerAAfter - takerABefore).to.equal(depositAmount);
     expect(makerBAfter - makerBBefore).to.equal(newReceiveAmount);
+  });
+
+  // ---------- Expiration ----------
+
+  // Reads unix_timestamp straight from the Clock sysvar: the same value the program sees.
+  // Clock layout: slot u64 | epoch_start_timestamp i64 | epoch u64 | leader_schedule_epoch u64 | unix_timestamp i64
+  const chainNow = async (): Promise<number> => {
+    const info = await provider.connection.getAccountInfo(anchor.web3.SYSVAR_CLOCK_PUBKEY);
+    return Number(info!.data.readBigInt64LE(32));
+  };
+
+  const waitUntilChainTime = async (target: number) => {
+    while ((await chainNow()) < target) {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+  };
+
+  const escrowAccountsFor = (seed: anchor.BN) => {
+    const [pda] = anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), maker.toBuffer(), seed.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+    return { escrow: pda, vault: getAssociatedTokenAddressSync(mintA, pda, true) };
+  };
+
+  const makeEscrow = (seed: anchor.BN, expiration: number | null) => {
+    const { escrow, vault } = escrowAccountsFor(seed);
+    return program.methods
+      .make(
+        seed,
+        new anchor.BN(depositAmount),
+        new anchor.BN(receiveAmount),
+        expiration === null ? null : new anchor.BN(expiration)
+      )
+      .accountsStrict({
+        maker,
+        mintA,
+        mintB,
+        makerAtaA,
+        escrow,
+        vault,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+  };
+
+  const takeEscrow = (seed: anchor.BN) => {
+    const { escrow, vault } = escrowAccountsFor(seed);
+    return program.methods
+      .take(new anchor.BN(receiveAmount))
+      .accountsStrict({
+        taker: taker.publicKey,
+        maker,
+        mintA,
+        mintB,
+        takerAtaA,
+        takerAtaB,
+        makerAtaB,
+        escrow,
+        vault,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([taker])
+      .rpc();
+  };
+
+  const expectError = async (promise: Promise<unknown>, code: string) => {
+    try {
+      await promise;
+      expect.fail(`expected ${code}`);
+    } catch (err) {
+      expect((err as anchor.AnchorError).error?.errorCode.code, String(err)).to.equal(code);
+    }
+  };
+
+  it("Rejects making an escrow that is already expired", async () => {
+    const seed = new anchor.BN(4444);
+    await expectError(makeEscrow(seed, (await chainNow()) - 10), "InvalidExpiration");
+  });
+
+  it("Blocks take after expiration; maker extends it and the taker can take", async () => {
+    const seed = new anchor.BN(5555);
+    const { escrow } = escrowAccountsFor(seed);
+    const expiration = (await chainNow()) + 2;
+
+    await makeEscrow(seed, expiration);
+    expect((await program.account.escrow.fetch(escrow)).expiration.toNumber()).to.equal(expiration);
+
+    await waitUntilChainTime(expiration);
+
+    // Expired: taker cannot take
+    await expectError(takeEscrow(seed), "EscrowExpired");
+
+    // Maker cannot set an expiration in the past
+    await expectError(
+      program.methods
+        .updateExpiration(new anchor.BN((await chainNow()) - 1))
+        .accountsStrict({ maker, escrow })
+        .rpc(),
+      "InvalidExpiration"
+    );
+
+    // Maker extends the expiration by an hour
+    const newExpiration = (await chainNow()) + 3600;
+    await program.methods
+      .updateExpiration(new anchor.BN(newExpiration))
+      .accountsStrict({ maker, escrow })
+      .rpc();
+    expect((await program.account.escrow.fetch(escrow)).expiration.toNumber()).to.equal(newExpiration);
+
+    // Taker can now take
+    await takeEscrow(seed);
+    expect(await provider.connection.getAccountInfo(escrow)).to.be.null;
+  });
+
+  it("Maker can refund an expired escrow", async () => {
+    const seed = new anchor.BN(6666);
+    const { escrow, vault } = escrowAccountsFor(seed);
+    const expiration = (await chainNow()) + 2;
+
+    await makeEscrow(seed, expiration);
+    await waitUntilChainTime(expiration);
+    await expectError(takeEscrow(seed), "EscrowExpired");
+
+    const makerABefore = (await provider.connection.getTokenAccountBalance(makerAtaA)).value.uiAmount;
+
+    await program.methods
+      .refund()
+      .accountsStrict({
+        maker,
+        mintA,
+        makerAtaA,
+        escrow,
+        vault,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    expect(await provider.connection.getAccountInfo(escrow)).to.be.null;
+    const makerAAfter = (await provider.connection.getTokenAccountBalance(makerAtaA)).value.uiAmount;
+    expect(makerAAfter - makerABefore).to.equal(depositAmount);
+  });
+
+  it("Maker can remove the expiration entirely", async () => {
+    const seed = new anchor.BN(7777);
+    const { escrow } = escrowAccountsFor(seed);
+
+    await makeEscrow(seed, (await chainNow()) + 3600);
+    await program.methods.updateExpiration(null).accountsStrict({ maker, escrow }).rpc();
+    expect((await program.account.escrow.fetch(escrow)).expiration).to.be.null;
+
+    await takeEscrow(seed);
+    expect(await provider.connection.getAccountInfo(escrow)).to.be.null;
   });
 });
