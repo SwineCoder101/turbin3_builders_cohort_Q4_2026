@@ -27,7 +27,6 @@ const toSol = (lamports: bigint) => Number(lamports) / 1e9;
   try {
     const asset = await fetchAsset(umi, assetAddress);
 
-    // only the owner (or a burn delegate) can destroy the asset
     if (asset.owner !== signer.publicKey) {
       throw new Error("your wallet does not own this asset, so it can't burn it");
     }
@@ -35,14 +34,10 @@ const toSol = (lamports: bigint) => Number(lamports) / 1e9;
     const before = await umi.rpc.getAccount(assetAddress);
     const rentBefore = before.exists ? before.lamports.basisPoints : 0n;
 
-    // burn wipes the asset's data and refunds its rent to the payer (us)
     const tx = await burn(umi, { asset }).sendAndConfirm(umi);
 
     const signature = base58.deserialize(tx.signature)[0];
 
-    // Core shrinks the account to a 1-byte tombstone so the address can never
-    // be reused. What stays behind is rent for that byte plus Metaplex's
-    // protocol fee held in the account, which the owner can't withdraw.
     const after = await umi.rpc.getAccount(assetAddress);
     const rentAfter = after.exists ? after.lamports.basisPoints : 0n;
     const tombstoneRent = (await umi.rpc.getRent(1)).basisPoints;

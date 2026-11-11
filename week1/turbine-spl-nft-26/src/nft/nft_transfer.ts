@@ -18,10 +18,8 @@ const signer = createSignerFromKeypair(umi, keypair);
 umi.use(signerIdentity(signer));
 umi.use(mplCore());
 
-//paste the asset address logged by nft_mint.ts
 const assetAddress = publicKey("kARw6p4ZnVXz4SyjrzRF9azFCcT4Mks3Ym1YSLv7CBX");
 
-//paste the wallet address of the new owner
 const newOwner = publicKey("9EUd4VNcjMAysd7zQk3Q1a4tb28BYndLNBAQDiYnHJ64");
 
 (async () => {
