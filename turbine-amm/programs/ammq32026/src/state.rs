@@ -8,7 +8,14 @@ pub struct Config {
     pub mint_x: Pubkey,            // Token X
     pub mint_y: Pubkey,            // Token Y
     pub fee: u16,                  // Swap fee in basis points
-    pub locked: bool,              // If the pool is locked
-    pub config_bump: u8,           // Bump seed for the config account
-    pub lp_bump: u8,               // Bump seed for the LP token
+    pub withdraw_lp_fee: u16,
+    pub locked: bool,    // If the pool is locked
+    pub config_bump: u8, // Bump seed for the config account
+    pub lp_bump: u8,     // Bump seed for the LP token
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct Quote {
+    pub x: u64,
+    pub y: u64,
 }

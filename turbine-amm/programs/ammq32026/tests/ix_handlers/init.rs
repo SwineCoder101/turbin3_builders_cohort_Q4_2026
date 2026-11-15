@@ -28,6 +28,7 @@ pub fn create_initialise_ix(
         &ammq32026::instruction::Initialize {
             seed: 123,
             fee: 30,
+            withdraw_lp_fee: 10,
             authority: Some(maker),
         }
         .data(),

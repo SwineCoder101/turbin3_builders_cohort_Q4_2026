@@ -5,7 +5,7 @@ use anchor_spl::{
 };
 use constant_product_curve::ConstantProduct;
 
-use crate::{error::AmmError, state::Config};
+use crate::{error::AmmError, state::Config, PRECISION};
 
 #[derive(Accounts)]
 pub struct Deposit<'info> {
@@ -20,24 +20,28 @@ pub struct Deposit<'info> {
         bump = config.config_bump,
     )]
     pub config: Account<'info, Config>,
+
     #[account(
         mut,
         seeds = [b"lp", config.key().as_ref()],
         bump = config.lp_bump,
     )]
     pub mint_lp: Account<'info, Mint>,
+
     #[account(
         mut,
         associated_token::mint = mint_x,
         associated_token::authority = config,
     )]
     pub vault_x: Box<Account<'info, TokenAccount>>,
+
     #[account(
         mut,
         associated_token::mint = mint_y,
         associated_token::authority = config,
     )]
     pub vault_y: Box<Account<'info, TokenAccount>>,
+
     #[account(
         mut,
         associated_token::mint = mint_x,
@@ -82,7 +86,7 @@ impl<'info> Deposit<'info> {
                     self.vault_y.amount,
                     self.mint_lp.supply,
                     amount,
-                    6,
+                    PRECISION,
                 )
                 .unwrap();
 
@@ -101,6 +105,7 @@ impl<'info> Deposit<'info> {
         // mint lp tokens
         self.mint_lp_tokens(amount)
     }
+
     pub fn deposit_tokens(&self, is_x: bool, amount: u64) -> Result<()> {
         let (from, to) = match is_x {
             true => (
