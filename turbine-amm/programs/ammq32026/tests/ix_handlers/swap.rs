@@ -10,9 +10,8 @@ use {
     solana_signer::Signer,
 };
 
-/// Builds a `swap` instruction: the trader sends `amount_in` of X (`is_x = true`)
-/// or Y (`is_x = false`) and must receive at least `min_out` of the other token.
-/// The trader's X and Y ATAs must already exist.
+use super::treasury_pda;
+
 pub fn create_swap_ix(
     trader: &Keypair,
     mint_x: Pubkey,
@@ -25,6 +24,7 @@ pub fn create_swap_ix(
     min_out: u64,
 ) -> Instruction {
     let trader_pk = trader.pubkey();
+    let treasury = treasury_pda(&config);
 
     Instruction::new_with_bytes(
         ammq32026::id(),
@@ -43,6 +43,9 @@ pub fn create_swap_ix(
             config,
             vault_ata_x: vault_x,
             vault_ata_y: vault_y,
+            treasury,
+            treasury_ata_x: associated_token::get_associated_token_address(&treasury, &mint_x),
+            treasury_ata_y: associated_token::get_associated_token_address(&treasury, &mint_y),
             token_program: TOKEN_PROGRAM_ID,
             system_program: SYSTEM_PROGRAM_ID,
             associated_token_program: ASSOCIATED_TOKEN_PROGRAM_ID,

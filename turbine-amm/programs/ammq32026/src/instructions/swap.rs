@@ -5,7 +5,11 @@ use anchor_spl::{
 };
 use constant_product_curve::ConstantProduct;
 
-use crate::{error::AmmError, state::Config, Quote};
+use crate::{
+    error::AmmError,
+    state::{Config, Treasury},
+    Quote,
+};
 
 #[derive(Accounts)]
 pub struct Swap<'info> {
@@ -46,6 +50,27 @@ pub struct Swap<'info> {
     )]
     pub vault_ata_y: Box<Account<'info, TokenAccount>>,
 
+    // Required: a pool can't be swapped until its treasury is initialized, so a
+    // trader can never skip the protocol fee by leaving the treasury out.
+    #[account(
+        has_one = config,
+        seeds = [b"treasury", config.key().as_ref()],
+        bump = treasury.bump,
+    )]
+    pub treasury: Box<Account<'info, Treasury>>,
+
+    #[account(mut,
+        associated_token::mint = mint_x,
+        associated_token::authority = treasury,
+    )]
+    pub treasury_ata_x: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut,
+        associated_token::mint = mint_y,
+        associated_token::authority = treasury,
+    )]
+    pub treasury_ata_y: Box<Account<'info, TokenAccount>>,
+
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -59,10 +84,57 @@ impl<'info> Swap<'info> {
         let amount_out = if is_x { quote.y } else { quote.x };
         require_gte!(amount_out, min_out, AmmError::SlippageExceeded);
 
-        // trader → vault: the FULL amount_in, so the fee stays in the pool as LP yield
-        self.deposit_tokens(is_x, amount_in)?;
+        // Split the input: the protocol's cut goes to the treasury, the rest
+        // (including the LPs' share of the fee) goes into the vault.
+        let protocol_fee = self.protocol_fee(amount_in)?;
+        let to_vault = amount_in
+            .checked_sub(protocol_fee)
+            .ok_or(AmmError::Underflow)?;
+
+        // trader → vault
+        self.deposit_tokens(is_x, to_vault)?;
+        // trader → treasury
+        if protocol_fee > 0 {
+            self.pay_protocol_fee(is_x, protocol_fee)?;
+        }
         // vault → trader: the other token
         self.withdraw_tokens(amount_out, !is_x)
+    }
+
+    /// The protocol's cut of a swap input, rounded down.
+    /// `protocol_fee_bps <= config.fee` (enforced at treasury init), so this is
+    /// always part of the fee the trader already pays, never an extra charge.
+    pub fn protocol_fee(&self, amount_in: u64) -> Result<u64> {
+        let fee = (amount_in as u128)
+            .checked_mul(self.treasury.protocol_fee_bps as u128)
+            .ok_or(AmmError::Overflow)?
+            / 10_000;
+        Ok(fee as u64)
+    }
+
+    /// trader → treasury, in the input token. The trader signs, so no PDA seeds needed.
+    pub fn pay_protocol_fee(&self, is_x: bool, amount: u64) -> Result<()> {
+        let (from, to) = match is_x {
+            true => (
+                self.trader_ata_x.to_account_info(),
+                self.treasury_ata_x.to_account_info(),
+            ),
+            false => (
+                self.trader_ata_y.to_account_info(),
+                self.treasury_ata_y.to_account_info(),
+            ),
+        };
+
+        let ctx = CpiContext::new(
+            self.token_program.key(),
+            Transfer {
+                from,
+                to,
+                authority: self.trader.to_account_info(),
+            },
+        );
+
+        transfer(ctx, amount)
     }
 
     pub fn withdraw_tokens(&self, amount: u64, is_x: bool) -> Result<()> {

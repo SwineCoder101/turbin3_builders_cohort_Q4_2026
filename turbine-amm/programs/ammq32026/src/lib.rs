@@ -25,6 +25,10 @@ pub mod ammq32026 {
             .init(seed, fee, withdraw_lp_fee, authority, ctx.bumps)
     }
 
+    pub fn initialize_treasury(ctx: Context<InitializeTreasury>, protocol_fee_bps: u16) -> Result<()> {
+        ctx.accounts.init_treasury(protocol_fee_bps, &ctx.bumps)
+    }
+
     pub fn deposit(ctx: Context<Deposit>, amount: u64, max_x: u64, max_y: u64) -> Result<()> {
         ctx.accounts.deposit(amount, max_x, max_y)
     }

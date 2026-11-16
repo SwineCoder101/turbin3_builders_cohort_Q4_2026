@@ -1,4 +1,5 @@
 use {
+    anchor_lang::AccountDeserialize,
     anchor_spl::associated_token,
     litesvm::LiteSVM,
     litesvm_token::{get_spl_account, spl_token, CreateAssociatedTokenAccount, CreateMint, MintTo},
@@ -186,12 +187,42 @@ impl Pool {
     }
 }
 
+impl Pool {
+    fn treasury(&self) -> Pubkey {
+        treasury_pda(&self.config)
+    }
+
+    fn treasury_ata(&self, mint: &Pubkey) -> Pubkey {
+        associated_token::get_associated_token_address(&self.treasury(), mint)
+    }
+
+    fn init_treasury(&mut self, authority: &Keypair, protocol_fee_bps: u16) -> litesvm::types::TransactionResult {
+        let ix = create_initialize_treasury_ix(
+            authority, self.mint_x, self.mint_y, self.config, protocol_fee_bps,
+        );
+        send(&mut self.svm, &[ix], authority, &[authority])
+    }
+}
+
 fn ata_of(owner: &Keypair, mint: &Pubkey) -> Pubkey {
     associated_token::get_associated_token_address(&owner.pubkey(), mint)
 }
 
-/// Initialize the pool and make the first deposit, so there is LP to withdraw.
+/// Protocol's cut of each swap input (bps), out of the pool's 30 bps fee.
+const PROTOCOL_FEE_BPS: u64 = 5;
+
+/// Initialize the pool, its treasury, and make the first deposit.
 fn setup_pool_with_deposit() -> Pool {
+    let mut pool = setup_pool_without_treasury();
+    let payer = pool.payer.insecure_clone();
+    pool.init_treasury(&payer, PROTOCOL_FEE_BPS as u16)
+        .expect("treasury init failed");
+    pool
+}
+
+/// Initialize the pool and make the first deposit, so there is LP to withdraw.
+/// No treasury yet: swaps on this pool must fail.
+fn setup_pool_without_treasury() -> Pool {
     let (mut svm, payer, mint_x, mint_y, config, mint_lp, vault_x, vault_y) = setup();
 
     let init_ix = create_initialise_ix(
@@ -308,9 +339,13 @@ fn test_swap_x_for_y() {
     // Trader paid X and received Y.
     assert_eq!(token_balance(&pool.svm, &ata_of(&trader, &pool.mint_x)), TRADER_FUNDS - amount_in);
     assert_eq!(token_balance(&pool.svm, &ata_of(&trader, &pool.mint_y)), TRADER_FUNDS + expected_out);
-    // The vault received the FULL input (fee included) and paid out Y.
-    assert_eq!(token_balance(&pool.svm, &pool.vault_x), DEPOSIT_X + amount_in);
+    // The vault received the input minus the protocol's cut, and paid out Y.
+    let cut = protocol_cut(amount_in);
+    assert_eq!(token_balance(&pool.svm, &pool.vault_x), DEPOSIT_X + amount_in - cut);
     assert_eq!(token_balance(&pool.svm, &pool.vault_y), DEPOSIT_Y - expected_out);
+    // The protocol's cut landed in the treasury, in the input token.
+    assert_eq!(token_balance(&pool.svm, &pool.treasury_ata(&pool.mint_x)), cut);
+    assert_eq!(token_balance(&pool.svm, &pool.treasury_ata(&pool.mint_y)), 0);
 }
 
 #[test]
@@ -326,8 +361,11 @@ fn test_swap_y_for_x() {
 
     assert_eq!(token_balance(&pool.svm, &ata_of(&trader, &pool.mint_y)), TRADER_FUNDS - amount_in);
     assert_eq!(token_balance(&pool.svm, &ata_of(&trader, &pool.mint_x)), TRADER_FUNDS + expected_out);
-    assert_eq!(token_balance(&pool.svm, &pool.vault_y), DEPOSIT_Y + amount_in);
+    let cut = protocol_cut(amount_in);
+    assert_eq!(token_balance(&pool.svm, &pool.vault_y), DEPOSIT_Y + amount_in - cut);
     assert_eq!(token_balance(&pool.svm, &pool.vault_x), DEPOSIT_X - expected_out);
+    assert_eq!(token_balance(&pool.svm, &pool.treasury_ata(&pool.mint_y)), cut);
+    assert_eq!(token_balance(&pool.svm, &pool.treasury_ata(&pool.mint_x)), 0);
 }
 
 #[test]
@@ -340,7 +378,7 @@ fn test_swap_keeps_k_from_decreasing() {
 
     let k_after = token_balance(&pool.svm, &pool.vault_x) as u128
         * token_balance(&pool.svm, &pool.vault_y) as u128;
-    // The fee stays in the pool, so k strictly grows.
+    // The LPs' share of the fee stays in the pool, so k strictly grows.
     assert!(k_after > k_before, "k shrank: {k_before} -> {k_after}");
 }
 
@@ -359,6 +397,7 @@ fn test_swap_fails_when_slippage_exceeded() {
     assert_eq!(token_balance(&pool.svm, &ata_of(&trader, &pool.mint_x)), TRADER_FUNDS);
     assert_eq!(token_balance(&pool.svm, &pool.vault_x), DEPOSIT_X);
     assert_eq!(token_balance(&pool.svm, &pool.vault_y), DEPOSIT_Y);
+    assert_eq!(token_balance(&pool.svm, &pool.treasury_ata(&pool.mint_x)), 0);
 }
 
 #[test]
@@ -377,7 +416,7 @@ fn test_swap_fails_when_output_rounds_to_zero() {
 }
 
 #[test]
-fn test_swap_fees_become_lp_yield() {
+fn test_swap_fees_split_between_lps_and_treasury() {
     let mut pool = setup_pool_with_deposit();
     let trader = pool.new_trader(TRADER_FUNDS);
 
@@ -387,18 +426,98 @@ fn test_swap_fees_become_lp_yield() {
     pool.swap(&trader, true, x_in, y_received).unwrap();
     pool.swap(&trader, false, y_received, 0).unwrap();
 
-    // The round trip cost the trader X: that's the fees (and rounding) left in the pool.
+    let cut_x = protocol_cut(x_in); // protocol's cut of leg 1, paid in X
+    let cut_y = protocol_cut(y_received); // protocol's cut of leg 2, paid in Y
+
     let trader_x = token_balance(&pool.svm, &ata_of(&trader, &pool.mint_x));
     let trader_loss = TRADER_FUNDS - trader_x;
-    assert!(trader_loss > 0);
-    assert_eq!(token_balance(&pool.svm, &pool.vault_x), DEPOSIT_X + trader_loss);
-    assert_eq!(token_balance(&pool.svm, &pool.vault_y), DEPOSIT_Y);
+    assert!(trader_loss > 0, "a round trip must cost the trader fees");
 
-    // The LP (sole liquidity provider) withdraws everything and gets back MORE X than
-    // they deposited: the trader's fees, with no "yield" bookkeeping anywhere.
-    pool.withdraw(DEPOSIT_LP, DEPOSIT_X, DEPOSIT_Y).unwrap();
+    // The treasury holds exactly the protocol's cut of each leg.
+    let treasury_x = token_balance(&pool.svm, &pool.treasury_ata(&pool.mint_x));
+    let treasury_y = token_balance(&pool.svm, &pool.treasury_ata(&pool.mint_y));
+    assert_eq!(treasury_x, cut_x);
+    assert_eq!(treasury_y, cut_y);
+
+    // Conservation: every token is with the trader, in the vault, or in the treasury.
+    let vault_x = token_balance(&pool.svm, &pool.vault_x);
+    let vault_y = token_balance(&pool.svm, &pool.vault_y);
+    let trader_y = token_balance(&pool.svm, &ata_of(&trader, &pool.mint_y));
+    assert_eq!(trader_x + vault_x + treasury_x, TRADER_FUNDS + DEPOSIT_X);
+    assert_eq!(trader_y + vault_y + treasury_y, TRADER_FUNDS + DEPOSIT_Y);
+
+    // The LP (sole liquidity provider) withdraws everything.
+    pool.withdraw(DEPOSIT_LP, 0, 0).unwrap();
     let lp_x = token_balance(&pool.svm, &pool.user_ata(&pool.mint_x));
     let lp_y = token_balance(&pool.svm, &pool.user_ata(&pool.mint_y));
-    assert_eq!(lp_x, MINTED_TO_USER + trader_loss);
-    assert_eq!(lp_y, MINTED_TO_USER);
+    assert_eq!(lp_x, MINTED_TO_USER + trader_loss - cut_x);
+    assert_eq!(lp_y, MINTED_TO_USER - cut_y);
+
+    // At the ~1:1 pool price, the LPs' share of the fees (25 bps per leg)
+    // is worth far more than the protocol's (5 bps per leg).
+    let lp_gain = (lp_x + lp_y) - 2 * MINTED_TO_USER;
+    assert!(lp_gain > treasury_x + treasury_y, "LPs should earn more than the protocol");
+}
+
+// ---------- Treasury ----------
+
+fn protocol_cut(amount_in: u64) -> u64 {
+    amount_in * PROTOCOL_FEE_BPS / 10_000
+}
+
+fn read_treasury(pool: &Pool) -> ammq32026::Treasury {
+    let account = pool.svm.get_account(&pool.treasury()).expect("treasury not found");
+    ammq32026::Treasury::try_deserialize(&mut account.data.as_slice()).unwrap()
+}
+
+#[test]
+fn test_initialize_treasury() {
+    let pool = setup_pool_with_deposit();
+
+    let treasury = read_treasury(&pool);
+    assert_eq!(treasury.config, pool.config);
+    assert_eq!(treasury.authority, pool.payer.pubkey());
+    assert_eq!(treasury.protocol_fee_bps as u64, PROTOCOL_FEE_BPS);
+
+    // Both treasury token accounts exist, owned by the treasury PDA, and start empty.
+    for mint in [pool.mint_x, pool.mint_y] {
+        let ata = get_spl_account::<spl_token::state::Account>(&pool.svm, &pool.treasury_ata(&mint)).unwrap();
+        assert_eq!(ata.owner, pool.treasury());
+        assert_eq!(ata.amount, 0);
+    }
+}
+
+#[test]
+fn test_initialize_treasury_fails_for_non_authority() {
+    let mut pool = setup_pool_without_treasury();
+    let stranger = Keypair::new();
+    pool.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
+
+    assert_anchor_error(pool.init_treasury(&stranger, 5), "InvalidAuthority");
+}
+
+#[test]
+fn test_initialize_treasury_fails_when_protocol_fee_exceeds_pool_fee() {
+    let mut pool = setup_pool_without_treasury();
+    let payer = pool.payer.insecure_clone();
+
+    // Pool fee is 30 bps; the protocol can take at most all of it.
+    assert_anchor_error(pool.init_treasury(&payer, 31), "ProtocolFeeTooHigh");
+    assert!(pool.init_treasury(&payer, 30).is_ok());
+}
+
+#[test]
+fn test_initialize_treasury_twice_fails() {
+    let mut pool = setup_pool_with_deposit();
+    let payer = pool.payer.insecure_clone();
+    // `init` refuses an account that already exists, so the fee can't be reset this way.
+    assert!(pool.init_treasury(&payer, 0).is_err());
+    assert_eq!(read_treasury(&pool).protocol_fee_bps as u64, PROTOCOL_FEE_BPS);
+}
+
+#[test]
+fn test_swap_fails_without_treasury() {
+    let mut pool = setup_pool_without_treasury();
+    let trader = pool.new_trader(TRADER_FUNDS);
+    assert_anchor_error(pool.swap(&trader, true, 10_000_000, 0), "AccountNotInitialized");
 }

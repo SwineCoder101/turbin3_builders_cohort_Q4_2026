@@ -14,6 +14,18 @@ pub struct Config {
     pub lp_bump: u8,     // Bump seed for the LP token
 }
 
+/// Protocol treasury for one pool. PDA: ["treasury", config].
+/// Owns the treasury token accounts (ATAs for mint_x and mint_y) that collect
+/// the protocol's share of every swap fee.
+#[account]
+#[derive(InitSpace)]
+pub struct Treasury {
+    pub config: Pubkey,        // The pool this treasury belongs to
+    pub authority: Pubkey,     // Who controls the treasury (the pool authority at init)
+    pub protocol_fee_bps: u16, // Protocol's cut of each swap input, in bps; <= config.fee
+    pub bump: u8,
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct Quote {
     pub x: u64,

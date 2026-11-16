@@ -41,6 +41,8 @@ pub enum AmmError {
     InsufficientBalance,
     #[msg("Zero balance.")]
     ZeroBalance,
+    #[msg("Protocol fee cannot exceed the pool's swap fee.")]
+    ProtocolFeeTooHigh,
 }
 
 impl From<CurveError> for AmmError {
