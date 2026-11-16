@@ -33,7 +33,15 @@ pub mod ammq32026 {
         ctx.accounts.withdraw(amount, min_x, min_y)
     }
 
-    pub fn quote(ctx: Context<Withdraw>, amount: u64) -> Result<Quote> {
+    pub fn quote_lp(ctx: Context<Withdraw>, amount: u64) -> Result<Quote> {
         ctx.accounts.quote(amount)
+    }
+
+    pub fn swap(ctx: Context<Swap>, is_x: bool, amount_in: u64, min_out: u64) -> Result<()> {
+        ctx.accounts.swap(is_x, amount_in, min_out)
+    }
+
+    pub fn quote_swap(ctx: Context<Swap>, amount: u64, is_x: bool) -> Result<Quote> {
+        ctx.accounts.quote(amount, is_x)
     }
 }

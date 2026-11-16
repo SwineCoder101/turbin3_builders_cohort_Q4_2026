@@ -1,7 +1,7 @@
 use {
     anchor_spl::associated_token,
     litesvm::LiteSVM,
-    litesvm_token::{get_spl_account, spl_token, CreateMint},
+    litesvm_token::{get_spl_account, spl_token, CreateAssociatedTokenAccount, CreateMint, MintTo},
     solana_keypair::Keypair,
     solana_message::{Instruction, Message, VersionedMessage},
     solana_pubkey::Pubkey,
@@ -154,6 +154,40 @@ impl Pool {
         );
         send(&mut self.svm, &[ix], &self.payer, &[&self.payer])
     }
+
+    /// A fresh trader (not the LP) with SOL and X/Y ATAs funded with `amount` each.
+    fn new_trader(&mut self, amount: u64) -> Keypair {
+        let trader = Keypair::new();
+        self.svm.airdrop(&trader.pubkey(), 1_000_000_000).unwrap();
+        for mint in [self.mint_x, self.mint_y] {
+            let ata = CreateAssociatedTokenAccount::new(&mut self.svm, &self.payer, &mint)
+                .owner(&trader.pubkey())
+                .send()
+                .unwrap();
+            MintTo::new(&mut self.svm, &self.payer, &mint, &ata, amount)
+                .send()
+                .unwrap();
+        }
+        trader
+    }
+
+    fn swap(
+        &mut self,
+        trader: &Keypair,
+        is_x: bool,
+        amount_in: u64,
+        min_out: u64,
+    ) -> litesvm::types::TransactionResult {
+        let ix = create_swap_ix(
+            trader, self.mint_x, self.mint_y, self.config, self.vault_x, self.vault_y,
+            is_x, amount_in, min_out,
+        );
+        send(&mut self.svm, &[ix], trader, &[trader])
+    }
+}
+
+fn ata_of(owner: &Keypair, mint: &Pubkey) -> Pubkey {
+    associated_token::get_associated_token_address(&owner.pubkey(), mint)
 }
 
 /// Initialize the pool and make the first deposit, so there is LP to withdraw.
@@ -244,4 +278,127 @@ fn test_withdraw_fails_for_more_than_supply() {
     let res = pool.withdraw(DEPOSIT_LP + 1, 0, 0);
     assert_anchor_error(res, "InsufficientBalance");
     assert_eq!(token_balance(&pool.svm, &pool.vault_x), DEPOSIT_X);
+}
+
+// ---------- Swap ----------
+
+// Matches `fee: 30` in ix_handlers/init.rs (0.30%).
+const FEE_BPS: u64 = 30;
+const TRADER_FUNDS: u64 = 100_000_000;
+
+/// Independent re-implementation of the swap pricing, to check the program against:
+/// take the fee off the input, then out = reserve_out - k / (reserve_in + input_after_fee).
+fn expected_swap_out(reserve_in: u64, reserve_out: u64, amount_in: u64) -> u64 {
+    let after_fee = amount_in as u128 * (10_000 - FEE_BPS as u128) / 10_000;
+    let k = reserve_in as u128 * reserve_out as u128;
+    (reserve_out as u128 - k / (reserve_in as u128 + after_fee)) as u64
+}
+
+#[test]
+fn test_swap_x_for_y() {
+    let mut pool = setup_pool_with_deposit();
+    let trader = pool.new_trader(TRADER_FUNDS);
+
+    let amount_in = 10_000_000;
+    let expected_out = expected_swap_out(DEPOSIT_X, DEPOSIT_Y, amount_in);
+
+    let res = pool.swap(&trader, true, amount_in, expected_out);
+    assert!(res.is_ok(), "swap failed: {:?}", res.err());
+
+    // Trader paid X and received Y.
+    assert_eq!(token_balance(&pool.svm, &ata_of(&trader, &pool.mint_x)), TRADER_FUNDS - amount_in);
+    assert_eq!(token_balance(&pool.svm, &ata_of(&trader, &pool.mint_y)), TRADER_FUNDS + expected_out);
+    // The vault received the FULL input (fee included) and paid out Y.
+    assert_eq!(token_balance(&pool.svm, &pool.vault_x), DEPOSIT_X + amount_in);
+    assert_eq!(token_balance(&pool.svm, &pool.vault_y), DEPOSIT_Y - expected_out);
+}
+
+#[test]
+fn test_swap_y_for_x() {
+    let mut pool = setup_pool_with_deposit();
+    let trader = pool.new_trader(TRADER_FUNDS);
+
+    let amount_in = 10_000_000;
+    let expected_out = expected_swap_out(DEPOSIT_Y, DEPOSIT_X, amount_in);
+
+    let res = pool.swap(&trader, false, amount_in, expected_out);
+    assert!(res.is_ok(), "swap failed: {:?}", res.err());
+
+    assert_eq!(token_balance(&pool.svm, &ata_of(&trader, &pool.mint_y)), TRADER_FUNDS - amount_in);
+    assert_eq!(token_balance(&pool.svm, &ata_of(&trader, &pool.mint_x)), TRADER_FUNDS + expected_out);
+    assert_eq!(token_balance(&pool.svm, &pool.vault_y), DEPOSIT_Y + amount_in);
+    assert_eq!(token_balance(&pool.svm, &pool.vault_x), DEPOSIT_X - expected_out);
+}
+
+#[test]
+fn test_swap_keeps_k_from_decreasing() {
+    let mut pool = setup_pool_with_deposit();
+    let trader = pool.new_trader(TRADER_FUNDS);
+    let k_before = DEPOSIT_X as u128 * DEPOSIT_Y as u128;
+
+    pool.swap(&trader, true, 10_000_000, 0).unwrap();
+
+    let k_after = token_balance(&pool.svm, &pool.vault_x) as u128
+        * token_balance(&pool.svm, &pool.vault_y) as u128;
+    // The fee stays in the pool, so k strictly grows.
+    assert!(k_after > k_before, "k shrank: {k_before} -> {k_after}");
+}
+
+#[test]
+fn test_swap_fails_when_slippage_exceeded() {
+    let mut pool = setup_pool_with_deposit();
+    let trader = pool.new_trader(TRADER_FUNDS);
+
+    let amount_in = 10_000_000;
+    let expected_out = expected_swap_out(DEPOSIT_X, DEPOSIT_Y, amount_in);
+
+    // Demand 1 more than the pool will give.
+    assert_anchor_error(pool.swap(&trader, true, amount_in, expected_out + 1), "SlippageExceeded");
+
+    // Nothing moved.
+    assert_eq!(token_balance(&pool.svm, &ata_of(&trader, &pool.mint_x)), TRADER_FUNDS);
+    assert_eq!(token_balance(&pool.svm, &pool.vault_x), DEPOSIT_X);
+    assert_eq!(token_balance(&pool.svm, &pool.vault_y), DEPOSIT_Y);
+}
+
+#[test]
+fn test_swap_fails_for_zero_amount() {
+    let mut pool = setup_pool_with_deposit();
+    let trader = pool.new_trader(TRADER_FUNDS);
+    assert_anchor_error(pool.swap(&trader, true, 0, 0), "InvalidAmount");
+}
+
+#[test]
+fn test_swap_fails_when_output_rounds_to_zero() {
+    let mut pool = setup_pool_with_deposit();
+    let trader = pool.new_trader(TRADER_FUNDS);
+    // 1 base unit in: the fee leaves 0 to price, so the output would be 0.
+    assert_anchor_error(pool.swap(&trader, true, 1, 0), "InvalidAmount");
+}
+
+#[test]
+fn test_swap_fees_become_lp_yield() {
+    let mut pool = setup_pool_with_deposit();
+    let trader = pool.new_trader(TRADER_FUNDS);
+
+    // Trader swaps X -> Y, then swaps all that Y straight back to X.
+    let x_in = 10_000_000;
+    let y_received = expected_swap_out(DEPOSIT_X, DEPOSIT_Y, x_in);
+    pool.swap(&trader, true, x_in, y_received).unwrap();
+    pool.swap(&trader, false, y_received, 0).unwrap();
+
+    // The round trip cost the trader X: that's the fees (and rounding) left in the pool.
+    let trader_x = token_balance(&pool.svm, &ata_of(&trader, &pool.mint_x));
+    let trader_loss = TRADER_FUNDS - trader_x;
+    assert!(trader_loss > 0);
+    assert_eq!(token_balance(&pool.svm, &pool.vault_x), DEPOSIT_X + trader_loss);
+    assert_eq!(token_balance(&pool.svm, &pool.vault_y), DEPOSIT_Y);
+
+    // The LP (sole liquidity provider) withdraws everything and gets back MORE X than
+    // they deposited: the trader's fees, with no "yield" bookkeeping anywhere.
+    pool.withdraw(DEPOSIT_LP, DEPOSIT_X, DEPOSIT_Y).unwrap();
+    let lp_x = token_balance(&pool.svm, &pool.user_ata(&pool.mint_x));
+    let lp_y = token_balance(&pool.svm, &pool.user_ata(&pool.mint_y));
+    assert_eq!(lp_x, MINTED_TO_USER + trader_loss);
+    assert_eq!(lp_y, MINTED_TO_USER);
 }
